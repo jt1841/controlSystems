@@ -1,0 +1,608 @@
+/* --------------------------------------------------------------------------------------------------- **
+** ECE 4550 L02												                                           **
+** Lab 8: PWM Operation of Converter-Fed DC Motors
+** Task 2											                 ** Programmers: Taeyup Kim and Jonathan Talbott			                                       	       **
+** --------------------------------------------------------------------------------------------------- */
+
+//Pre-Processor Directives
+#include "F2806x_Device.h"
+#include "F2806x_PieVect.h"
+#include "math.h"
+#define PI 3.141593
+
+
+#define Vm 2.0 // positive magnitude of three phase set of terminal voltages
+#define Vdc 24.0 // DC supply voltage
+
+//Global Variables to set (Set these variables for initialization of the system)
+	int32 dataSampling = 1;
+	int32 systemClock = 90;			//Set system clock frequency in MHz
+	float32 interruptClock = 0.005; //Set interrupt frequency on Timer0 in MHz (ftmr)
+
+//Global Variables
+	int16 currentFlag = 0;
+	float32 aV20 = 20;			//Average voltage for time interval of 0.2 seconds will be +-20 volts.
+	float32 aV0 = 0;			//Average voltage for time interval of 0.2 seconds will be 0 volts.
+	int32 delayVar = 0;			//Counter variable for the delay function
+	int16 DIVbit;				//DIVbit will be set by systemClockInitialization().
+	int16 DIVSELbit;			//DIVSELbit will be set by systemClockInitialization().
+	float32 dutyA;
+	float32 dutyB;
+	float32 dutyC;
+	Uint16 lastSampleIA = 1850;
+	Uint16 lastSampleIB = 1850;
+	Uint16 lastSampleIC = 1850;
+	Uint16 lastSampleVA;
+	Uint16 lastSampleVB;
+	Uint16 lastSampleVC;
+	float32 tempIA;
+	float32 tempIB;
+	float32 tempIC;
+	float32 currentA[500];
+	float32 currentB[500];
+	float32 currentC[500];
+	float32 theta[500];
+	int32 thetaTemp;
+	float32 thetaRef = 0.0;
+
+	float32 vAk;
+	float32 vBk;
+	float32 vCk;
+
+	float32 vA; //leg voltage
+	float32 vB;
+	float32 vC;
+
+	float32 va; //phase voltage
+	float32 vb;
+	float32 vc;
+
+	float32 iA; //leg current
+	float32 iB;
+	float32 iC;
+
+	float32 ia; //phase current
+	float32 ib;
+	float32 ic;
+
+	int32 count = 0;
+	int32 counter = 0;
+	int32 counter2 = 0;
+
+//State Space Control Variables
+	float32 K11;
+	float32 K12;
+	float32 K2;
+	float32 L1;
+	float32 L2;
+	float32 alpha;
+	float32 beta;
+	float32 T;
+	float32 N;
+	float32 K;
+	float32 R;
+	float32 F;
+	float32 J;
+	float32 LAMBDA;
+	float32 lambda_r;
+	float32 lambda_e;
+	float32 Vmax;
+
+	float32 u = 0;
+	float32 v = 0;
+	float32 sigma = 0;
+	float32 xHat1 = 0;
+	float32 xHat1_temp = 0;
+	float32 xHat2 = 0;
+	float32 y = 0;
+	float32 r = 0;
+	float32 phi = 0;
+	int32 y_s = 0;
+
+//New & Changed Function Prototypes
+	float32 round(float32 number);
+	void QEPinitilization(void);	//Initilization of QEP module
+	void PWMinitilization(void);		//Initilization of PWM module
+	interrupt void timerISR(void);	//Timer ISR is programmed to achieve the desired average voltage.
+	interrupt void adcISR(void);		//ISR for the ADC. This will Receive analog measurement conversions.
+	void adcConfig(void);		//ADC configuration for triggering on PWM signals
+
+//Reused Function Prototypes
+	void serviceWatchdog(void);		//Function to service the watchdog timer
+	void disableWatchdog(void);		//Function to disable the watchdog timer
+	void enableWatchdog(void);		//Function to enable the watchdog timer
+	void systemClockInitilization(void);  //Function to set system clock speed
+	void timerInitilization(void);	//Function to set the timer reset frequency
+	void interruptInitilization(void);	//Function to setup the interrupt for Timer0
+	void delay(int32 delayTime);		//Function to wait (delayTime is in ms).
+	void startUpProcedure(void);
+	void dutyCalc(void);		//calculations for duty cycles
+	void stateSpaceConstants(void);
+
+
+//Main function
+void main(void)
+{
+	//Initial Setup
+	disableWatchdog();			//Disable watchdog timer for initial setup
+	stateSpaceConstants();
+	dutyCalc();
+	systemClockInitilization();		//Set the system clock based on the global variable: systemClock
+	timerInitilization();		//Set the timer frequency: interruptClock (ftmr)
+	adcConfig();			//Enable ADC and configure the pins and triggers for the ADC module
+	interruptInitilization();		//Load PIEVector table and initialize interrupts
+	startUpProcedure();
+	PWMinitilization();		//Setup PWM with the converter leg signals
+	QEPinitilization();
+	delay(1000);
+
+	EALLOW;
+	EQep1Regs.QPOSINIT = 0;
+	EQep1Regs.QEPCTL.bit.SWI = 1;
+	EDIS;
+
+	CpuTimer0Regs.TCR.bit.TSS = 0; 	//Re-start Timer0
+	enableWatchdog();			//Re-enable the watchdog timer
+
+	while(1)
+	{
+		serviceWatchdog();		//Continue to service the watchdog timer
+	}
+}
+
+void stateSpaceConstants(void)
+{
+	N = 4.0;
+	R = 1.2;
+	J = 4.8e-6;
+	F = 5.0e-5;
+	LAMBDA = 11.0e-3;
+	T = 2.0e-4;
+	lambda_r = 100;
+	lambda_e = 4*lambda_r;
+	K = LAMBDA*N;
+	alpha = (K*K + F*R)/(J*R);
+	beta = K/(J*R);
+	Vmax = 1.0606602*Vdc;
+	L1 = 2*lambda_e - alpha;
+	L2 = lambda_e*lambda_e - 2*alpha*lambda_e + alpha*alpha;
+	K11 = 3*lambda_r*lambda_r/(beta);
+	K12 = (3*lambda_r - alpha)/(beta);
+	K2 = (lambda_r*lambda_r*lambda_r)/(beta);
+
+}
+
+void startUpProcedure(void)
+{
+	vA = .5*Vdc + Vm*cos(N*thetaRef - PI/6);
+	vB = .5*Vdc + Vm*cos(N*thetaRef - PI/6 - 2*PI/3);
+	vC = .5*Vdc + Vm*cos(N*thetaRef - PI/6 + 2*PI/3);
+
+	dutyCalc();
+
+}
+
+void dutyCalc(void)
+{
+
+	dutyA = (vA / Vdc) * 1500;
+	dutyB = (vB / Vdc) * 1500;
+	dutyC = (vC / Vdc) * 1500;
+
+}
+//New Functions
+
+void QEPinitilization(void)
+{
+EALLOW;
+//2.1.1 Set the Pin Multiplexer
+	GpioCtrlRegs.GPAMUX2.bit.GPIO20 = 1;   	// Configure GPIO20 as EQEP1A
+	GpioCtrlRegs.GPAMUX2.bit.GPIO21 = 1;   	// Configure GPIO21 as EQEP1B
+
+//2.1.2 Enable the Module Clock
+	SysCtrlRegs.PCLKCR1.bit.EQEP1ENCLK = 1;	//(Table 1-16) Enable the clock for EQEP1 set to systemClock
+	asm(" NOP"); asm(" NOP");
+//2.1.3 Set the Module Maximum Count
+	EQep1Regs.QPOSMAX = 0xFFFFFFFF;		//(Table 7-9) Set maximum count value.
+
+//2.1.4 Enable and Initialize the Module Counter
+	EQep1Regs.QEPCTL.bit.QPEN = 1;		//(Table 7-4) The eQEP position counter is enabled
+	EQep1Regs.QPOSINIT = 0;
+	EQep1Regs.QEPCTL.bit.SWI = 1;		//(Table 7-4) Initialize position counter (QPOSCNT=QPOSINIT)
+EDIS;
+
+}
+
+void PWMinitilization(void){
+
+	EALLOW;
+	//2.1.1 Set the Pin Multiplexer
+	GpioCtrlRegs.GPAMUX1.bit.GPIO0 = 1;		//Use PWM HB1 for A control leg signal
+	GpioCtrlRegs.GPAMUX1.bit.GPIO1 = 1;		//Use PWM HB2 for B control leg signal
+
+	GpioCtrlRegs.GPBMUX1.bit.GPIO32 = 0;	//Reset pin
+	GpioCtrlRegs.GPBDIR.bit.GPIO32 = 1;		//Configure as output
+
+	//2.1.2 Enable the Module Clock
+	SysCtrlRegs.PCLKCR1.bit.EPWM1ENCLK = 1;	//Enable the clock module for ePWM1. (Table 1-16)
+	asm(" NOP"); asm(" NOP");
+
+	//2.1.3 Configure the Time Base Clock and Counter
+	EPwm1Regs.TBCTL.bit.CTRMODE = 2;		//Set the counting mode to UP-DOWN (Table 3-29)(pg 336)
+	EPwm1Regs.TBPRD = 1500;			//Set TBPRD to 1500 for a vres value of 32 mV. (Table 3-22)
+	EPwm1Regs.TBCTL.bit.HSPCLKDIV = 0;		//Set divisor to /1 so Fpwm is 30kHZ(Table 3-29)
+
+	//2.1.4 Set the Output Actions
+	EPwm1Regs.AQCTLA.bit.CAU = 1;		//Ac Signal goes low when counter reaches CMPA (Counting up)
+	EPwm1Regs.AQCTLA.bit.CAD = 2;		//Ac Signal goes high when counter reaches CMPA (Counting down)
+											//(Table 3-38)
+
+	EPwm1Regs.AQCTLB.bit.CBU = 1;		//Bc Signal goes low when counter reaches CMPB (Counting up)
+	EPwm1Regs.AQCTLB.bit.CBD = 2;		//Bc Signal goes high when counter reaches CMPB (Counting down)
+
+	//2.1.5 Set the Event Triggers
+	EPwm1Regs.ETSEL.bit.SOCASEL = 2;		//(Table 3-63) enable SOC when at period (Used for Current)
+	EPwm1Regs.ETSEL.bit.SOCAEN = 1;		//Enable
+	EPwm1Regs.ETPS.bit.SOCAPRD = 1;		//Trigger on first even
+
+	EPwm1Regs.ETSEL.bit.SOCBSEL = 3;		//(Table 3-63) enable SOC at zero (Used for Voltages)
+	EPwm1Regs.ETSEL.bit.SOCBEN = 1;		//Enable
+	EPwm1Regs.ETPS.bit.SOCBPRD = 1;		//Trigger on first event
+	EPwm1Regs.CMPA.half.CMPA = dutyA;		//Set the value of the duty cycle (calculated above)
+	EPwm1Regs.CMPB = dutyB;
+
+	//second duty cycle
+
+	//2.1.1 Set the Pin Multiplexer
+	GpioCtrlRegs.GPAMUX1.bit.GPIO2 = 1;		//Use PWM HB3 for C control leg signal
+
+	//2.1.2 Enable the Module Clock
+	SysCtrlRegs.PCLKCR1.bit.EPWM2ENCLK = 1;	//Enable the clock module for ePWM1. (Table 1-16)
+	asm(" NOP"); asm(" NOP");
+
+	//2.1.3 Configure the Time Base Clock and Counter
+	EPwm2Regs.TBCTL.bit.CTRMODE = 2;		//Set the counting mode to UP-DOWN (Table 3-29)(pg 336)
+	EPwm2Regs.TBPRD = 1500;			//Set TBPRD to 1500 for a vres value of 32 mV. (Table 3-22)
+	EPwm2Regs.TBCTL.bit.HSPCLKDIV = 0;		//Set divisor to /1 so Fpwm is 30kHZ(Table 3-29)
+
+	//2.1.4 Set the Output Actions
+	EPwm2Regs.AQCTLA.bit.CAU = 1;		//Ac Signal goes low when counter reaches CMPA (Counting up)
+	EPwm2Regs.AQCTLA.bit.CAD = 2;		//Ac Signal goes high when counter reaches CMPA (Counting down)
+											//(Table 3-38)
+
+	//2.1.5 Set the Event Triggers
+	EPwm2Regs.ETSEL.bit.SOCASEL = 2;		//(Table 3-63) enable SOC when at period (Used for Current)
+	EPwm2Regs.ETSEL.bit.SOCAEN = 1;		//Enable
+	EPwm2Regs.ETPS.bit.SOCAPRD = 1;		//Trigger on first even
+
+	EPwm2Regs.ETSEL.bit.SOCBSEL = 3;		//(Table 3-63) enable SOC at zero (Used for Voltages)
+	EPwm2Regs.ETSEL.bit.SOCBEN = 1;		//Enable
+	EPwm2Regs.ETPS.bit.SOCBPRD = 1;		//Trigger on first event
+
+
+	SysCtrlRegs.PCLKCR0.bit.TBCLKSYNC = 1;	//Enable the time based clock (Table 1-15)
+	asm(" NOP"); asm(" NOP");
+
+	EPwm2Regs.CMPA.half.CMPA = dutyC;		//Set the value of the duty cycle (calculated above)
+
+	GpioDataRegs.GPBSET.bit.GPIO32 = 1;		//Set reset high to enable output to DC motor
+	EDIS;
+}
+
+
+
+interrupt void timerISR(void)
+{
+
+	y_s = (int32)EQep1Regs.QPOSCNT; //input position
+	y = (float32)(y_s*2.0*PI)/4000.0;
+
+	if(counter == 0)
+		r = 2*PI;
+	if(counter == 2900)
+		r = 0;
+
+
+	u = -K11*xHat1 - K12*xHat2 - K2*sigma;
+
+	if( fabs(u) > Vmax )
+	{
+		v = Vmax;
+
+		if(u < 0)
+			u = -Vmax;
+		if(u >= 0)
+			u = Vmax;
+	}
+	else
+	{
+		v = fabs(u);
+	}
+
+
+	if( u >= 0){phi = PI/2;}
+	else{phi = -PI/2;}
+
+	xHat1_temp = xHat1;
+	xHat1 = xHat1 + T*xHat2 - T*L1*(xHat1 - y);
+	xHat2 = xHat2 - T*alpha*xHat2+T*beta*u - T*L2*(xHat1_temp - y);
+	sigma = sigma + T*(y - r);
+
+	vA = .5*Vdc + .471405*v*cos(N*xHat1 + phi - PI/6);
+	vB = .5*Vdc + .471405*v*cos(N*xHat1 + phi - PI/6 - 2*PI/3);
+	vC = .5*Vdc + .471405*v*cos(N*xHat1 + phi - PI/6 + 2*PI/3);
+
+	dutyCalc();
+	EPwm1Regs.CMPA.half.CMPA = dutyA;
+	EPwm1Regs.CMPB = dutyB;
+	EPwm2Regs.CMPA.half.CMPA = dutyC;
+
+
+//Sampling
+
+	if(counter2 < 500 & counter%10 == 0)
+	{
+		thetaTemp = (int32)EQep1Regs.QPOSCNT;
+
+		theta[counter2] = (float32)(thetaTemp*2.0*PI)/4000.0;
+		tempIA = (float32)lastSampleIA;
+		tempIB = (float32)lastSampleIB;
+		tempIC = (float32)lastSampleIC;
+
+		tempIA *= (3.3/4096);
+		tempIB *= (3.3/4096);
+		tempIC *= (3.3/4096);
+		currentA[counter2] = (6.060727272727273*tempIA - 7.963171487603*1.25);
+		currentB[counter2] = (6.060727272727273*tempIB - 7.963171487603*1.25);
+		currentC[counter2] = (6.060727272727273*tempIC - 7.963171487603*1.25);
+		counter2++;
+	}
+
+	if(currentFlag == 1)
+		currentFlag = 1;
+
+
+	PieCtrlRegs.PIEACK.bit.ACK1 = 1;		//2.2.4 Acknowledge the Interrupt
+
+	if(counter == 5800){counter = -1;}
+
+	counter++;
+}
+
+interrupt void adcISR(void)
+{
+
+	lastSampleIA = (Uint16)AdcResult.ADCRESULT0;	//Read current "voltage" IA from ADCRESULT register
+	lastSampleIB = (Uint16)AdcResult.ADCRESULT1;
+	lastSampleIC = (Uint16)AdcResult.ADCRESULT2;
+	lastSampleVA = (Uint16)AdcResult.ADCRESULT3;	//Read voltage value VA from ADCRESULT register
+	lastSampleVB = (Uint16)AdcResult.ADCRESULT4;	//Read voltage value VB from ADCRESULT register
+	lastSampleVC = (Uint16)AdcResult.ADCRESULT5;
+
+
+	//Implement over current protection
+
+	if(count > 5)
+	{
+		//if(lastSampleIA < 1833 | lastSampleIA > 2243)	//1A current Protection
+		{
+			if(lastSampleIA < 809 | lastSampleIA > 3267) //6A current Protection
+			{
+			GpioDataRegs.GPBCLEAR.bit.GPIO32 = 1;
+			}
+		}
+
+		//if(lastSampleIB < 1833 | lastSampleIB > 2243)	//1A current Protection
+		{
+			if(lastSampleIB < 809 | lastSampleIB > 3267) //6A current Protection
+			{
+			GpioDataRegs.GPBCLEAR.bit.GPIO32 = 1;
+			}
+		}
+
+		//if(lastSampleIC < 1833 | lastSampleIC > 2243)	//1A current Protection
+		{
+			if(lastSampleIC < 809 | lastSampleIC > 3267) //6A current Protection
+			{
+			GpioDataRegs.GPBCLEAR.bit.GPIO32 = 1;
+			}
+		}
+	}
+
+
+	AdcRegs.ADCINTFLGCLR.bit.ADCINT2 = 1;			//2.2.3 Clear the Interrupt Flag
+	PieCtrlRegs.PIEACK.bit.ACK1 = 1;
+
+	if(count <= 5){count++;}
+}
+
+float32 round(float32 number)
+{
+    return (number >= 0) ? (int)(number + 0.5) : (int)(number - 0.5);
+}
+
+//Reused Functions
+
+void delay(int32 delayTime)
+{
+	disableWatchdog();
+	for (delayVar = 0; delayVar < delayTime*systemClock*100; delayVar++)
+	{
+		//wait here
+	}
+	enableWatchdog();
+}
+
+void adcConfig(void)
+{
+	//2.1.1 Enable and Configure the Module Clock
+	EALLOW;
+	SysCtrlRegs.PCLKCR0.bit.ADCENCLK = 1;	//The ADC Module is clocked (Table 1-15)
+	asm(" NOP"); asm(" NOP");
+	AdcRegs.ADCCTL2.bit.CLKDIV2EN = 1;		//Set clock to 1/2 the value of the system clock (45 MHz)
+	AdcRegs.ADCCTL2.bit.ADCNONOVERLAP = 1;	//Disable Overlaps (Table 8-4)(Eratta pg 12-13)
+	EDIS;
+
+	//2.1.2 Enable the Module Power Supply
+	EALLOW;
+	AdcRegs.ADCCTL1.bit.ADCPWDN = 1;		//Enable main analog circuits (Table 8-3)
+	AdcRegs.ADCCTL1.bit.ADCBGPWD = 1;		//Enable bandgap buffer circuit (Table 8-3)
+	AdcRegs.ADCCTL1.bit.ADCREFPWD = 1;		//Enable reference buffer circuit (Table 8-3)
+	AdcRegs.ADCCTL1.bit.ADCENABLE = 1;		//Enable ADC module (Table 8-3)
+	EDIS;
+	delay(10);								//Wait for delayTime
+
+	//2.1.3 Configure the Conversions
+	EALLOW;
+	AdcRegs.ADCSOC0CTL.bit.TRIGSEL = 0x5;	//Set the trigger ADCINA0 source to PWM1SOCA(Table 8-18)
+	AdcRegs.ADCSOC0CTL.bit.CHSEL = 0x0;		//Associate CHEL field with Header ADCINA0 for IA (Table 8-18)
+	AdcRegs.ADCSOC0CTL.bit.ACQPS = 7;		//Sample window (IA) is 8 cycles long(Table 8-18)
+
+	AdcRegs.ADCSOC1CTL.bit.TRIGSEL = 0x5;	//Set the trigger ADCINA0 source to PWM1SOCA(Table 8-18)
+	AdcRegs.ADCSOC1CTL.bit.CHSEL = 0x1;		//Associate CHEL field with Header ADCINA0 for IA (Table 8-18)
+	AdcRegs.ADCSOC1CTL.bit.ACQPS = 7;		//Sample window (IB) is 8 cycles long(Table 8-18)
+
+	AdcRegs.ADCSOC2CTL.bit.TRIGSEL = 0x5;	//Set the trigger ADCINA0 source to PWM1SOCA(Table 8-18)
+	AdcRegs.ADCSOC2CTL.bit.CHSEL = 0x2;		//Associate CHEL field with Header ADCINA0 for IA (Table 8-18)
+	AdcRegs.ADCSOC2CTL.bit.ACQPS = 7;		//Sample window (IC) is 8 cycles long(Table 8-18)
+
+	AdcRegs.ADCSOC3CTL.bit.TRIGSEL = 0x6;	//Set the trigger ADCINB4 source to PWM1SOCB(Table 8-18)
+	AdcRegs.ADCSOC3CTL.bit.CHSEL = 0xC;		//Associate CHEL field with Header ADCINB4 for VA (Table 8-18)
+	AdcRegs.ADCSOC3CTL.bit.ACQPS = 7;		//Sample window (VA) is 8 cycles long (Table 8-18)
+
+	AdcRegs.ADCSOC4CTL.bit.TRIGSEL = 0x6;	//Set the trigger ADCINB5 source to PWM1SOCB(Table 8-18)
+	AdcRegs.ADCSOC4CTL.bit.CHSEL = 0xD;		//Associate CHEL field with Header ADCINB5 for VB (Table 8-18)
+	AdcRegs.ADCSOC4CTL.bit.ACQPS = 7;		//Sample window (VB) is 8 cycles long (Table 8-18)
+
+	AdcRegs.ADCSOC5CTL.bit.TRIGSEL = 0x6;	//Set the trigger ADCINB6 source to PWM2SOCA(Table 8-18)
+	AdcRegs.ADCSOC5CTL.bit.CHSEL = 0xE;		//Associate CHEL field with Header ADCINB6 for VC (Table 8-18)
+	AdcRegs.ADCSOC5CTL.bit.ACQPS = 7;		//Sample window (VC) is 8 cycles long (Table 8-18)
+
+	EDIS;
+
+}
+
+void serviceWatchdog(void)
+{
+	  EALLOW;
+	  SysCtrlRegs.WDKEY = 0x55;
+	  SysCtrlRegs.WDKEY = 0xAA;
+	  EDIS;
+}
+
+void disableWatchdog(void)
+{
+	EALLOW;
+	SysCtrlRegs.WDCR = 0x68;
+	EDIS;
+}
+
+void enableWatchdog(void)
+{
+	EALLOW;
+	SysCtrlRegs.WDCR = 0x28;
+	EDIS;
+}
+
+void systemClockInitilization(void)
+{
+	//Initiate the system clock according to Figure 1-24
+	//(Below speed is in MHz and Assumes OSCCLK = 10 MHz)(Table 1-24)
+	// Speed  -------- DIV -------- DIVSEL 		// Speed  -------- DIV -------- DIVSEL
+	//   90   --------  9  --------    3		//   32.5 --------  13 --------    1
+	//   85   --------  17 --------    2		//   30   --------  3  --------    3
+	//   80   --------  8  --------    3		//   27.5 --------  11 --------    1
+	//   75   --------  15 --------    2		//   25   --------  5  --------    2
+	//   70   --------  7  --------    3		//   22.5 --------  9  --------    1
+	//   65   --------  13 --------    2		//   20   --------  2  --------    3
+	//   60   --------  6  --------    3		//   17.5 --------  7  --------    1
+	//   55   --------  11 --------    2		//   15   --------  3  --------    2
+	//   50   --------  5  --------    3		//   12.5 --------  5  --------    1
+	//   45   --------  9  --------    2		//   10   --------  1  --------    3
+	//   42.5 --------  17 --------    1		//   7.5  --------  3  --------    1
+	//   40   --------  4  --------    3		//   5    --------  1  --------    2
+	//   37.5 --------  15 --------    1		//   2.5  --------  1  --------    1
+	//   35   --------  7  --------    2
+
+	//Assigns DIV and DIVSEL based on table above.
+		if(systemClock%10 == 0)
+		{
+		DIVSELbit = 3;
+		DIVbit = systemClock/10;
+		}
+		else if (systemClock%5 == 0)
+		{
+		DIVSELbit = 2;
+		DIVbit = systemClock/5;
+		}
+		else
+		{
+		DIVSELbit = 1;
+		DIVbit = systemClock/2.5;
+		}
+
+	//Initiate the system clock
+		EALLOW;
+
+		if(SysCtrlRegs.PLLSTS.bit.MCLKSTS == 1) //Check to see if device is operating in limp mode
+		{
+			ESTOP0; 							//Stop device
+		}
+
+		if (SysCtrlRegs.PLLSTS.bit.DIVSEL == 3 | SysCtrlRegs.PLLSTS.bit.MCLKSTS == 2)
+		{
+			SysCtrlRegs.PLLSTS.bit.DIVSEL = 0;  //Set DIVSEL to zero if it is not already
+		}
+
+		SysCtrlRegs.PLLSTS.bit.MCLKOFF = 1;		//Disable failed oscillator detect logic
+		SysCtrlRegs.PLLCR.bit.DIV = DIVbit;		//DIV set (Table 1-24)
+
+		while( SysCtrlRegs.PLLSTS.bit.PLLLOCKS != 1 )
+		{
+			//wait for PLLLOCK to clear (=0)
+		}
+	
+		SysCtrlRegs.PLLSTS.bit.MCLKOFF = 0;	      //Enable failed oscillator detect logic
+		SysCtrlRegs.PLLSTS.bit.DIVSEL = DIVSELbit; //DIVSEL (Table 1-24)
+						     //This results in a system clock of 90 MHz
+		EDIS;
+}
+
+void timerInitilization(void)
+{
+
+		//Set the timer reset frequency
+		CpuTimer0Regs.PRD.all = systemClock/interruptClock - 1;
+
+		//Prepare Timer0 for Use
+		CpuTimer0Regs.TCR.bit.TSS = 1;		//Stop CPU Timer0 (Table 1-51)
+		CpuTimer0Regs.TCR.bit.TRB = 1;		//Load Timer0 (Table 1-51)
+		CpuTimer0Regs.TCR.bit.TIE = 1;		//Enable Timer Interrupts (Table 1-51)
+}
+
+void interruptInitilization(void)
+{
+	//2.1.4 Configure and Enable the Interrupts
+		EALLOW;
+		AdcRegs.INTSEL1N2.bit.INT2SEL = 0;		//EOC0 is trigger for ADCINT2 (Table 8-9)
+		AdcRegs.INTSEL1N2.bit.INT2E = 1;		//ADCINT2 is enabled(Table 8-9)
+		AdcRegs.ADCCTL1.bit.INTPULSEPOS = 1;		//INT pulse generation (Table 8-3)
+		EDIS;
+
+		//Load the PIE vector table
+		PieCtrlRegs.PIECTRL.bit.ENPIE = 1; 		//Enable PIE vector table (Table 1-121)
+		EALLOW;
+		PieVectTable.ADCINT2 = &adcISR;		//Point to ISR (Table 1-118)
+		PieVectTable.TINT0 = &timerISR;		//Point TINT0 (Timer 0) to the ISR (Table 1-118)
+
+		//Enable Interrupts at the PIE level
+		PieCtrlRegs.PIEIER1.bit.INTx7 = 1;
+		PieCtrlRegs.PIEIER1.bit.INTx2 = 1;
+		EDIS;
+
+		//Enable Interrupts at the CPU level
+		IER = 1;					// bit0 of IER enables INT1 (Table 1-126)
+		EINT;					// Globally enable CPU interrupts
+
+}
+
